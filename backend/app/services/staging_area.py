@@ -22,13 +22,16 @@ class StagingAreaService(BaseModuleService):
     ACTION_RULES = {"启动落地": "落地中", "确认落地": "已落地", "执行清空": "已清空"}
     NEGATIVE_ACTIONS = ["执行清空"]
 
-    def land_batch(self, batch_code: str, record_count: int) -> dict[str, Any]:
+    def land_batch(self, batch_code: str, record_count: int,
+                   chunk_size: int | None = None) -> dict[str, Any]:
         """将传输批次数据落地到暂存分区，读取传输产物文件并写入暂存产物文件。
 
         暂存分区是传输链路中数据暂存的关键环节：它从传输产物文件读取数据，
         计算字节量，写入落地路径下的暂存产物文件，并推进分区水位。
+        落地后以实际记录数对账新版分片进度，使暂存实际记录与分片边界一致。
         """
-        staging_code = f"STAG-{batch_code}-{int(time.time())}"
+        # 纳秒级编号避免同秒多次落地撞名导致产物文件重复追加。
+        staging_code = f"STAG-{batch_code}-{time.time_ns()}"
         landing_path = f"/staging/{batch_code}/"
         values = {
             "暂存编号": staging_code,
@@ -74,12 +77,21 @@ class StagingAreaService(BaseModuleService):
             "retention_seconds": 86400,
         })
 
+        # 以暂存实际记录对账新版分片进度（暂存落地与传输共享同一份分片记录）。
+        try:
+            sp_svc = self._safe_import("app.services.shard_progress", "ShardProgressService")()
+            shard_reconcile = sp_svc.reconcile_landed(
+                batch_code, written, chunk_size=chunk_size, source="staging_area")
+        except Exception as e:  # pragma: no cover - 对账失败不阻断落地主流程
+            shard_reconcile = {"error": str(e)}
+
         return {
             "staging_code": staging_code,
             "batch_code": batch_code,
             "records_landed": written,
             "total_bytes": total_bytes,
             "artifact_path": str(output_file),
+            "shard_reconcile": shard_reconcile,
         }
 
     def confirm_land(self, staging_id: int) -> dict[str, Any]:

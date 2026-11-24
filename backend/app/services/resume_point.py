@@ -24,7 +24,7 @@ class ResumePointService(BaseModuleService):
 
     def create_resume_point(self, batch_code: str, completed_chunks: int, pending_chunks: int) -> dict[str, Any]:
         """为传输中断批次创建断点续传记录，登记已完成分片、未完成分片和恢复位置。"""
-        resume_code = f"RESU-{batch_code}-{int(time.time())}"
+        resume_code = f"RESU-{batch_code}-{time.time_ns()}"
         values = {
             "断点编号": resume_code,
             "批次编号": batch_code,
@@ -45,14 +45,33 @@ class ResumePointService(BaseModuleService):
               "completed_chunks": completed_chunks, "pending_chunks": pending_chunks,
               "at": time.time()}]
         )
+
+        # 旧入口继续写旧版检查点：升级失败或回滚后，存量检查点仍可被旧版本读取。
+        self._write_checkpoint(f"resume_{batch_code}", {
+            "batch_code": batch_code,
+            "retry_count": 0,
+            "resume_position": completed_chunks,
+            "records_written": 0,
+            "registered_at": time.time(),
+        })
+
+        # 注意：此处不预建新版分片文档。批次 B「已登记恢复点但尚未执行」时，新版文档
+        # 应在首次迁移/恢复时由有效历史检查点翻译生成，避免空文档遮蔽真实分片边界。
+
         return {"resume_code": resume_code, "resume_id": entry["id"], "batch_code": batch_code,
                 "completed_chunks": completed_chunks, "pending_chunks": pending_chunks}
 
-    def resume_transfer(self, resume_id: int) -> dict[str, Any]:
-        """执行断点续传：从恢复位置重新传输未完成分片数据并写入续传产物文件。
+    def resume_transfer(self, resume_id: int, max_chunks: int | None = None,
+                        chunk_size: int | None = None) -> dict[str, Any]:
+        """执行断点续传：按新版分片进度从未完成分片恢复，并保留旧检查点双写。
 
-        本方法实现数据传输的高可用保障：读取批次产物文件，定位已完成的末位分片，
-        从未完成分片重新开始传输，记录重试次数并推进续传水位。
+        恢复流程：
+
+        1. 通过旧断点条目拿到批次编号，调用新版分片进度服务解析可解释的分片边界；
+           新版文档缺失时（升级失败/回滚/未迁移），由分片服务从有效历史检查点即时迁移。
+        2. 以分片为最小调度单位，只投递待传分片；产物中已落地的记录按 line_no 去重，
+           任何已交付分片都不会被重发。
+        3. 续传后同步推进续传水位与重试次数，并继续写旧版 resume 检查点，保证回滚可读。
         """
         resume_entry = self.get_entry(resume_id)
         if resume_entry is None:
@@ -64,28 +83,77 @@ class ResumePointService(BaseModuleService):
 
         batch_code = resume_entry["批次编号"]
         retry_count = int(resume_entry.get("重试次数", 0)) + 1
-        resume_position = int(resume_entry.get("恢复位置", 0))
+        legacy_position = int(resume_entry.get("恢复位置", 0))
 
-        # 读取原批次产物文件，定位未完成分片
+        sp_svc = self._safe_import("app.services.shard_progress", "ShardProgressService")()
+        boundary = sp_svc.resolve_resume_boundary(batch_code, chunk_size=chunk_size)
+
+        if boundary is not None:
+            # 新版分片边界可解析：传输与续传共享同一投递入口。
+            transfer_result = sp_svc.transfer_pending_chunks(
+                batch_code, max_chunks=max_chunks)
+            if "error" in transfer_result:
+                return {"error": transfer_result["error"], "resume_id": resume_id}
+
+            written = transfer_result["appended_records"]
+            new_position = transfer_result["actual_landed"]
+
+            # 续传产物文件（保留原有命名约定，便于旧版工具链识别）：只写本次追加的记录。
+            resume_file = self._data_dir("batches") / f"{batch_code}_resume_{retry_count}.jsonl"
+            appended_nos = set(transfer_result["appended_line_nos"])
+            if appended_nos:
+                artifact_records = self._read_jsonl(sp_svc._batch_artifact(batch_code))
+                self._write_jsonl(
+                    resume_file, [r for r in artifact_records if r.get("line_no") in appended_nos])
+
+            entry["重试次数"] = str(retry_count)
+            entry["续传水位"] = str(new_position)
+            entry["已完成分片"] = str(len(boundary["delivered_chunks"])
+                                      + len(transfer_result["chunks_done"]))
+
+            # 旧版续传检查点双写：回滚后旧版本仍可从记录级水位恢复。
+            self._write_checkpoint(f"resume_{batch_code}", {
+                "batch_code": batch_code,
+                "retry_count": retry_count,
+                "resume_position": new_position,
+                "records_written": written,
+                "delivered_chunks": sp_svc.get_progress(batch_code)["delivered_chunks"],
+                "shard_schema_version": 2,
+                "last_resumed_at": time.time(),
+            })
+
+            if transfer_result.get("completed"):
+                final_entry, _ = self.run_action(resume_id, "确认恢复")
+
+            return {
+                "resume_code": resume_entry["断点编号"],
+                "batch_code": batch_code,
+                "retry_count": retry_count,
+                "records_resumed": written,
+                "new_position": new_position,
+                "resume_boundary": {
+                    "pending_chunks": transfer_result["remaining_chunks"],
+                    "chunks_done_this_time": transfer_result["chunks_done"],
+                    "explanation": boundary["explanation"],
+                    "source": boundary["source"],
+                    "migrated_on_demand": boundary["migrated_on_demand"],
+                },
+            }
+
+        # 兜底：既无新版文档也无有效历史检查点时，保留旧版模拟续传行为。
         batch_file = self._data_dir("batches") / f"{batch_code}.jsonl"
         existing_records = self._read_jsonl(batch_file)
-
-        # 从恢复位置读取未传输记录
-        pending_records = existing_records[resume_position:] if resume_position < len(existing_records) else []
+        pending_records = existing_records[legacy_position:] if legacy_position < len(
+            existing_records) else []
         if not pending_records:
-            # 无已有数据则生成续传模拟数据
             pending_records = self._simulate_records(batch_code, count=5, field_prefix="resume")
 
-        # 续传写入
         resume_file = self._data_dir("batches") / f"{batch_code}_resume_{retry_count}.jsonl"
         written = self._write_jsonl(resume_file, pending_records)
-
-        # 更新断点水位
-        new_position = resume_position + written
+        new_position = legacy_position + written
         entry["重试次数"] = str(retry_count)
         entry["续传水位"] = str(new_position)
 
-        # 写入续传产物断点
         self._write_checkpoint(f"resume_{batch_code}", {
             "batch_code": batch_code,
             "retry_count": retry_count,
@@ -95,7 +163,7 @@ class ResumePointService(BaseModuleService):
         })
 
         if len(pending_records) > 0 and written > 0:
-            final_entry, _ = self.run_action(resume_id, "确认恢复")
+            self.run_action(resume_id, "确认恢复")
 
         return {
             "resume_code": resume_entry["断点编号"],
@@ -103,6 +171,7 @@ class ResumePointService(BaseModuleService):
             "retry_count": retry_count,
             "records_resumed": written,
             "new_position": new_position,
+            "resume_boundary": None,
         }
 
     def get_pending_resume_points(self) -> list[dict[str, Any]]:

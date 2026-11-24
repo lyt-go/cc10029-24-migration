@@ -24,7 +24,7 @@ class TransferBatchService(BaseModuleService):
 
     def create_batch(self, window_code: str, record_count: int, target_code: str = "TARG-0001") -> dict[str, Any]:
         """基于抽取窗口创建传输批次，传入产物文件的 record_count 并写入批次事件日志。"""
-        batch_code = f"TRAN-{window_code}-{int(time.time())}"
+        batch_code = f"TRAN-{window_code}-{time.time_ns()}"
         values = {
             "批次编号": batch_code,
             "窗口编号": window_code,
@@ -81,25 +81,35 @@ class TransferBatchService(BaseModuleService):
         total_bytes = 0
         total_written = 0
         chunks = []
+
+        # 登记新版分片进度文档：传输与断点续传共享同一份分片边界真相。
+        sp_svc = self._safe_import("app.services.shard_progress", "ShardProgressService")()
+        sp_svc.ensure_progress(
+            batch_code, total_records=len(records), chunk_size=chunk_size,
+            source="transfer_batch")
+
         for i in range(0, len(records), chunk_size):
+            chunk_index = i // chunk_size
             chunk = records[i:i + chunk_size]
             for rec in chunk:
                 rec["batch_code"] = batch_code
-                rec["chunk_index"] = i // chunk_size
+                rec["chunk_index"] = chunk_index
                 rec["transferred_at"] = time.time()
             self._write_jsonl(output_file, chunk)
             chunk_bytes = sum(len(str(r).encode("utf-8")) for r in chunk)
-            chunks.append({"chunk_index": i // chunk_size, "record_count": len(chunk),
+            chunks.append({"chunk_index": chunk_index, "record_count": len(chunk),
                            "bytes": chunk_bytes})
             total_bytes += chunk_bytes
             total_written += len(chunk)
+            # 每个分片落地后推进新版分片进度（幂等，重跑不会重复计数）。
+            sp_svc.mark_chunk_delivered(batch_code, chunk_index, source="transfer_batch")
 
         # 更新批次水位和字节总量
         entry["字节总量"] = str(total_bytes)
         entry["记录条数"] = str(total_written)
         entry["批次水位"] = str(total_written)
 
-        # 写入传输水位断点
+        # 写入传输水位断点（旧版检查点保留双写，回滚后旧版本仍可读取）
         self._write_checkpoint(f"batch_{batch_code}", {
             "batch_code": batch_code,
             "window_code": window_code,
@@ -109,6 +119,8 @@ class TransferBatchService(BaseModuleService):
             "watermark": str(total_written),
             "last_transfer_at": time.time(),
         })
+        # 用实际落地记录对账新版分片进度，确保两种检查点指向同一恢复边界。
+        sp_svc.reconcile_landed(batch_code, total_written, source="transfer_batch")
 
         result = {
             "batch_code": batch_code,
@@ -143,6 +155,25 @@ class TransferBatchService(BaseModuleService):
         except Exception as e:
             result["auto_reconcile"] = {"error": str(e)}
 
+        return result
+
+    def continue_transfer(self, batch_id: int, max_chunks: int | None = None) -> dict[str, Any]:
+        """切换中断后的续做入口：按新版分片进度只投递未完成分片，不重发已交付分片。"""
+        batch_entry = self.get_entry(batch_id)
+        if batch_entry is None:
+            return {"error": f"传输批次 {batch_id} 不存在"}
+        batch_code = batch_entry["批次编号"]
+        sp_svc = self._safe_import("app.services.shard_progress", "ShardProgressService")()
+        result = sp_svc.transfer_pending_chunks(batch_code, max_chunks=max_chunks)
+        if "error" in result:
+            return result
+        entry, _ = self.run_action(batch_id, "启动传输")
+        if entry is not None:
+            entry["批次水位"] = str(result["actual_landed"])
+            if result.get("completed"):
+                done, _ = self.run_action(batch_id, "标记完成")
+                if done is not None:
+                    result["batch_status"] = done["status"]
         return result
 
     def mark_completed(self, batch_id: int) -> dict[str, Any]:

@@ -12,6 +12,7 @@ from app.services.checksum_verify import ChecksumVerifyService
 from app.services.arrival_reconcile import ArrivalReconcileService
 from app.services.conflict_resolve import ConflictResolveService
 from app.services.resume_point import ResumePointService
+from app.services.shard_progress import ShardProgressService
 from app.services.speed_control import SpeedControlService
 from app.services.reject_record import RejectRecordService
 from app.services.format_adapt import FormatAdaptService
@@ -32,6 +33,7 @@ SERVICES: dict[str, BaseModuleService] = {
     "arrival_reconcile": ArrivalReconcileService(),
     "conflict_resolve": ConflictResolveService(),
     "resume_point": ResumePointService(),
+    "shard_progress": ShardProgressService(),
     "speed_control": SpeedControlService(),
     "reject_record": RejectRecordService(),
     "format_adapt": FormatAdaptService(),

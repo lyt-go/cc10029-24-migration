@@ -18,6 +18,7 @@
 │   ├── app/routers/resource.py  通用查询/导出/登记/动作接口
 │   ├── app/services/<key>.py    每个模块独立领域逻辑
 │   ├── app/services/base.py     共享服务骨架
+│   ├── app/services/shard_progress.py  新版分片进度记录与历史检查点迁移
 │   └── app/store.py          内存数据仓库与示例数据
 ├── .gitignore
 └── docker-compose.yml
@@ -60,6 +61,7 @@ npm run dev
 | 到达对账 | `arrival_reconcile` | 对账单 | 对账编号、批次编号、应到条数 |
 | 字段冲突 | `conflict_resolve` | 冲突记录 | 冲突编号、记录主键、冲突字段 |
 | 断点续传 | `resume_point` | 续传断点 | 断点编号、批次编号、已完成分片 |
+| 分片进度 | `shard_progress` | 分片进度记录 | 批次编号、分片大小、已交付分片、待传分片、边界说明 |
 | 速率整形 | `speed_control` | 限速策略 | 策略编号、作用范围、每秒记录数 |
 | 拒收回执 | `reject_record` | 拒收记录 | 拒收编号、批次编号、记录主键 |
 | 格式适配 | `format_adapt` | 适配版本 | 适配编号、记录格式、旧版结构 |
